@@ -1,0 +1,99 @@
+name: deployment
+
+on:
+  push:
+    branches:
+      - release
+
+env:
+  NODE_ENVIRONMENT: "development"
+  # GCP Project ID is only relevant for Cloud functions and Cloud Run and Specific resources located in the shared infrastructure project
+  PROJECT_ID: "${{secrets.GCP_PROJECT}}"
+
+  SERVICE_NAME: "ds-talk"
+
+jobs:
+  version:
+    name: Version
+    runs-on: ubuntu-latest
+    environment: dev
+    outputs:
+      DOCKER_TAG: ${{ steps.version.outputs.SHORT_HASH }}
+    steps:
+      - name: Get the version
+        id: version
+        uses: pondevelopment/actions/version@main
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: version
+    outputs:
+      DOCKER_IMAGE_ENCODED: ${{ steps.build_image.outputs.DOCKER_IMAGE_ENC }}
+      IMAGE_TAG: ${{ needs.version.outputs.DOCKER_TAG }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: "auth"
+        uses: "google-github-actions/auth@v0"
+        with:
+          credentials_json: "${{ secrets.GCP_SA_KEY }}"
+
+      - name: Setup Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v0
+        with:
+          project_id: ds-artifacts-01
+          export_default_credentials: true # Set to true to authenticate the Cloud Run action
+
+      - name: Authorize Docker push
+        shell: bash
+        run: gcloud auth configure-docker europe-west4-docker.pkg.dev --quiet
+
+      - name: Prepare
+        shell: bash
+        id: prepare
+        run: |
+          TAG=${{ needs.version.outputs.DOCKER_TAG }}
+          IMAGE="europe-west4-docker.pkg.dev/ds-artifacts-01/terxr/${{ env.SERVICE_NAME }}"
+          echo "tagged_image=${IMAGE}:${TAG}" >> $GITHUB_OUTPUT
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+      - name: Encode
+        shell: bash
+        id: encode
+        run: |
+          echo "tagged_image_enc=$(echo -n '${{steps.prepare.outputs.tagged_image}}' | base64 -w0 | base64 -w0 )" >> $GITHUB_OUTPUT
+      - name: Build Docker image
+        uses: docker/build-push-action@v3
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          # Note: load is used to store the image in the local docker daemon for use in another step
+          #load: true
+          tags: ${{ steps.prepare.outputs.tagged_image }}
+          # build arg used for accessing the private repository for npm modules
+          build-args: |
+            REVISION_HASH=${{ env.GITHUB_SHA }}
+
+  update-image:
+    runs-on: terxr-image-updater-${{ inputs.environment }}
+    name: Update image
+    needs:
+      - version
+      - test
+      - build
+    steps:
+      # To use this repository's private action,
+      # you must check out the repository
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Update image
+        uses: terxr-io/actions/imageupdate@v1.55
+        id: update-image
+        with:
+          stage: ${{ inputs.environment }}
+          tenant: ${{ inputs.ORGANIZATION }}
+          namespace: ${{ inputs.NAMESPACE }}
+          deployment: ${{ inputs.DEPLOYMENT }}
+          container: ${{ inputs.CONTAINER }}
+          image: europe-west4-docker.pkg.dev/ds-artifacts-01/terxr/${{ env.SERVICE_NAME }}:${{ needs.version.outputs.DOCKER_TAG }}
